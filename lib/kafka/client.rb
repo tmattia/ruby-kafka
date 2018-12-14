@@ -1,10 +1,13 @@
-require "openssl"
-require "uri"
+# frozen_string_literal: true
 
+require "kafka/ssl_context"
 require "kafka/cluster"
+require "kafka/transaction_manager"
+require "kafka/broker_info"
 require "kafka/producer"
 require "kafka/consumer"
 require "kafka/heartbeat"
+require "kafka/broker_uri"
 require "kafka/async_producer"
 require "kafka/fetched_message"
 require "kafka/fetch_operation"
@@ -14,8 +17,6 @@ require "kafka/sasl_authenticator"
 
 module Kafka
   class Client
-    URI_SCHEMES = ["kafka", "kafka+ssl"]
-
     # Initializes a new Kafka client.
     #
     # @param seed_brokers [Array<String>, String] the list of brokers used to initialize
@@ -45,6 +46,9 @@ module Kafka
     # @param ssl_client_cert_key [String, nil] a PEM encoded client cert key to use with an
     #   SSL connection. Must be used in combination with ssl_client_cert.
     #
+    # @param ssl_client_cert_key_password [String, nil] the password required to read the
+    #   ssl_client_cert_key. Must be used in combination with ssl_client_cert_key.
+    #
     # @param sasl_gssapi_principal [String, nil] a KRB5 principal
     #
     # @param sasl_gssapi_keytab [String, nil] a KRB5 keytab filepath
@@ -55,17 +59,28 @@ module Kafka
     #
     # @param sasl_scram_mechanism [String, nil] Scram mechanism, either "sha256" or "sha512"
     #
+    # @param sasl_over_ssl [Boolean] whether to enforce SSL with SASL
+    #
     # @return [Client]
     def initialize(seed_brokers:, client_id: "ruby-kafka", logger: nil, connect_timeout: nil, socket_timeout: nil,
                    ssl_ca_cert_file_path: nil, ssl_ca_cert: nil, ssl_client_cert: nil, ssl_client_cert_key: nil,
-                   sasl_gssapi_principal: nil, sasl_gssapi_keytab: nil,
-                   sasl_plain_authzid: '', sasl_plain_username: nil, sasl_plain_password: nil,
-                   sasl_scram_username: nil, sasl_scram_password: nil, sasl_scram_mechanism: nil, ssl_ca_certs_from_system: false)
+                   ssl_client_cert_key_password: nil, ssl_client_cert_chain: nil, sasl_gssapi_principal: nil,
+                   sasl_gssapi_keytab: nil, sasl_plain_authzid: '', sasl_plain_username: nil, sasl_plain_password: nil,
+                   sasl_scram_username: nil, sasl_scram_password: nil, sasl_scram_mechanism: nil,
+                   sasl_over_ssl: true, ssl_ca_certs_from_system: false)
       @logger = logger || Logger.new(nil)
       @instrumenter = Instrumenter.new(client_id: client_id)
       @seed_brokers = normalize_seed_brokers(seed_brokers)
 
-      ssl_context = build_ssl_context(ssl_ca_cert_file_path, ssl_ca_cert, ssl_client_cert, ssl_client_cert_key, ssl_ca_certs_from_system)
+      ssl_context = SslContext.build(
+        ca_cert_file_path: ssl_ca_cert_file_path,
+        ca_cert: ssl_ca_cert,
+        client_cert: ssl_client_cert,
+        client_cert_key: ssl_client_cert_key,
+        client_cert_key_password: ssl_client_cert_key_password,
+        client_cert_chain: ssl_client_cert_chain,
+        ca_certs_from_system: ssl_ca_certs_from_system,
+      )
 
       sasl_authenticator = SaslAuthenticator.new(
         sasl_gssapi_principal: sasl_gssapi_principal,
@@ -78,6 +93,10 @@ module Kafka
         sasl_scram_mechanism: sasl_scram_mechanism,
         logger: @logger
       )
+
+      if sasl_authenticator.enabled? && sasl_over_ssl && ssl_context.nil?
+        raise ArgumentError, "SASL authentication requires that SSL is configured"
+      end
 
       @connection_builder = ConnectionBuilder.new(
         client_id: client_id,
@@ -100,6 +119,7 @@ module Kafka
     #
     # @param value [String, nil] the message value.
     # @param key [String, nil] the message key.
+    # @param headers [Hash<String, String>] the headers for the message.
     # @param topic [String] the topic that the message should be written to.
     # @param partition [Integer, nil] the partition that the message should be written
     #   to, or `nil` if either `partition_key` is passed or the partition should be
@@ -109,16 +129,17 @@ module Kafka
     # @param retries [Integer] the number of times to retry the delivery before giving
     #   up.
     # @return [nil]
-    def deliver_message(value, key: nil, topic:, partition: nil, partition_key: nil, retries: 1)
+    def deliver_message(value, key: nil, headers: {}, topic:, partition: nil, partition_key: nil, retries: 1)
       create_time = Time.now
 
       message = PendingMessage.new(
-        value,
-        key,
-        topic,
-        partition,
-        partition_key,
-        create_time,
+        value: value,
+        key: key,
+        headers: headers,
+        topic: topic,
+        partition: partition,
+        partition_key: partition_key,
+        create_time: create_time
       )
 
       if partition.nil?
@@ -131,6 +152,7 @@ module Kafka
       buffer.write(
         value: message.value,
         key: message.key,
+        headers: message.headers,
         topic: message.topic,
         partition: partition,
         create_time: message.create_time,
@@ -142,8 +164,16 @@ module Kafka
         instrumenter: @instrumenter,
       )
 
+      transaction_manager = TransactionManager.new(
+        cluster: @cluster,
+        logger: @logger,
+        idempotent: false,
+        transactional: false
+      )
+
       operation = ProduceOperation.new(
         cluster: @cluster,
+        transaction_manager: transaction_manager,
         buffer: buffer,
         required_acks: 1,
         ack_timeout: 10,
@@ -206,15 +236,39 @@ module Kafka
     #   are per-partition rather than per-topic or per-producer.
     #
     # @return [Kafka::Producer] the Kafka producer.
-    def producer(compression_codec: nil, compression_threshold: 1, ack_timeout: 5, required_acks: :all, max_retries: 2, retry_backoff: 1, max_buffer_size: 1000, max_buffer_bytesize: 10_000_000)
+    def producer(
+      compression_codec: nil,
+      compression_threshold: 1,
+      ack_timeout: 5,
+      required_acks: :all,
+      max_retries: 2,
+      retry_backoff: 1,
+      max_buffer_size: 1000,
+      max_buffer_bytesize: 10_000_000,
+      idempotent: false,
+      transactional: false,
+      transactional_id: nil,
+      transactional_timeout: 60
+    )
+      cluster = initialize_cluster
       compressor = Compressor.new(
         codec_name: compression_codec,
         threshold: compression_threshold,
         instrumenter: @instrumenter,
       )
 
+      transaction_manager = TransactionManager.new(
+        cluster: cluster,
+        logger: @logger,
+        idempotent: idempotent,
+        transactional: transactional,
+        transactional_id: transactional_id,
+        transactional_timeout: transactional_timeout,
+      )
+
       Producer.new(
-        cluster: initialize_cluster,
+        cluster: cluster,
+        transaction_manager: transaction_manager,
         logger: @logger,
         instrumenter: @instrumenter,
         compressor: compressor,
@@ -268,8 +322,19 @@ module Kafka
     #   than the session window.
     # @param offset_retention_time [Integer] the time period that committed
     #   offsets will be retained, in seconds. Defaults to the broker setting.
+    # @param fetcher_max_queue_size [Integer] max number of items in the fetch queue that
+    #   are stored for further processing. Note, that each item in the queue represents a
+    #   response from a single broker.
     # @return [Consumer]
-    def consumer(group_id:, session_timeout: 30, offset_commit_interval: 10, offset_commit_threshold: 0, heartbeat_interval: 10, offset_retention_time: nil)
+    def consumer(
+        group_id:,
+        session_timeout: 30,
+        offset_commit_interval: 10,
+        offset_commit_threshold: 0,
+        heartbeat_interval: 10,
+        offset_retention_time: nil,
+        fetcher_max_queue_size: 100
+    )
       cluster = initialize_cluster
 
       instrumenter = DecoratingInstrumenter.new(@instrumenter, {
@@ -288,9 +353,18 @@ module Kafka
         instrumenter: instrumenter,
       )
 
+      fetcher = Fetcher.new(
+        cluster: initialize_cluster,
+        group: group,
+        logger: @logger,
+        instrumenter: instrumenter,
+        max_queue_size: fetcher_max_queue_size
+      )
+
       offset_manager = OffsetManager.new(
         cluster: cluster,
         group: group,
+        fetcher: fetcher,
         logger: @logger,
         commit_interval: offset_commit_interval,
         commit_threshold: offset_commit_threshold,
@@ -300,6 +374,7 @@ module Kafka
       heartbeat = Heartbeat.new(
         group: group,
         interval: heartbeat_interval,
+        instrumenter: instrumenter
       )
 
       Consumer.new(
@@ -308,6 +383,7 @@ module Kafka
         instrumenter: instrumenter,
         group: group,
         offset_manager: offset_manager,
+        fetcher: fetcher,
         session_timeout: session_timeout,
         heartbeat: heartbeat,
       )
@@ -441,7 +517,7 @@ module Kafka
 
         batches.each do |batch|
           batch.messages.each(&block)
-          offsets[batch.partition] = batch.last_offset + 1
+          offsets[batch.partition] = batch.last_offset + 1 unless batch.unknown_last_offset?
         end
       end
     end
@@ -505,6 +581,32 @@ module Kafka
       @cluster.describe_topic(name, configs)
     end
 
+    # Alter the configuration of a topic.
+    #
+    # Configuration keys must match
+    # [Kafka's topic-level configs](https://kafka.apache.org/documentation/#topicconfigs).
+    #
+    # @note This is an alpha level API and is subject to change.
+    #
+    # @example Describing the cleanup policy config of a topic
+    #   kafka = Kafka.new(["kafka1:9092"])
+    #   kafka.alter_topic("my-topic", "cleanup.policy" => "delete", "max.message.byte" => "100000")
+    #
+    # @param name [String] the name of the topic.
+    # @param configs [Hash<String, String>] hash of desired config keys and values.
+    # @return [nil]
+    def alter_topic(name, configs = {})
+      @cluster.alter_topic(name, configs)
+    end
+
+    # Describe a consumer group
+    #
+    # @param group_id [String] the id of the consumer group
+    # @return [Kafka::Protocol::DescribeGroupsResponse::Group]
+    def describe_group(group_id)
+      @cluster.describe_group(group_id)
+    end
+
     # Create partitions for a topic.
     #
     # @param name [String] the name of the topic.
@@ -521,7 +623,22 @@ module Kafka
     #
     # @return [Array<String>] the list of topic names.
     def topics
-      @cluster.list_topics
+      attempts = 0
+      begin
+        attempts += 1
+        @cluster.list_topics
+      rescue Kafka::ConnectionError
+        @cluster.mark_as_stale!
+        retry unless attempts > 1
+        raise
+      end
+    end
+
+    # Lists all consumer groups in the cluster
+    #
+    # @return [Array<String>] the list of group ids
+    def groups
+      @cluster.list_groups
     end
 
     def has_topic?(topic)
@@ -583,6 +700,20 @@ module Kafka
       @cluster.apis
     end
 
+    # List all brokers in the cluster.
+    #
+    # @return [Array<Kafka::BrokerInfo>] the list of brokers.
+    def brokers
+      @cluster.cluster_info.brokers
+    end
+
+    # The current controller broker in the cluster.
+    #
+    # @return [Kafka::BrokerInfo] information on the controller broker.
+    def controller_broker
+      brokers.find {|broker| broker.node_id == @cluster.cluster_info.controller_id }
+    end
+
     # Closes all connections to the Kafka brokers and frees up used resources.
     #
     # @return [nil]
@@ -605,55 +736,12 @@ module Kafka
       )
     end
 
-    def build_ssl_context(ca_cert_file_path, ca_cert, client_cert, client_cert_key, ssl_ca_certs_from_system)
-      return nil unless ca_cert_file_path || ca_cert || client_cert || client_cert_key || ssl_ca_certs_from_system
-
-      ssl_context = OpenSSL::SSL::SSLContext.new
-
-      if client_cert && client_cert_key
-        ssl_context.set_params(
-          cert: OpenSSL::X509::Certificate.new(client_cert),
-          key: OpenSSL::PKey.read(client_cert_key)
-        )
-      elsif client_cert && !client_cert_key
-        raise ArgumentError, "Kafka client initialized with `ssl_client_cert` but no `ssl_client_cert_key`. Please provide both."
-      elsif !client_cert && client_cert_key
-        raise ArgumentError, "Kafka client initialized with `ssl_client_cert_key`, but no `ssl_client_cert`. Please provide both."
-      end
-
-      if ca_cert || ca_cert_file_path || ssl_ca_certs_from_system
-        store = OpenSSL::X509::Store.new
-        Array(ca_cert).each do |cert|
-          store.add_cert(OpenSSL::X509::Certificate.new(cert))
-        end
-        if ca_cert_file_path
-          store.add_file(ca_cert_file_path)
-        end
-        if ssl_ca_certs_from_system
-          store.set_default_paths
-        end
-        ssl_context.cert_store = store
-      end
-
-      ssl_context
-    end
-
     def normalize_seed_brokers(seed_brokers)
       if seed_brokers.is_a?(String)
         seed_brokers = seed_brokers.split(",")
       end
 
-      seed_brokers.map do |connection|
-        connection = "kafka://" + connection unless connection =~ /:\/\//
-        uri = URI.parse(connection)
-        uri.port ||= 9092 # Default Kafka port.
-
-        unless URI_SCHEMES.include?(uri.scheme)
-          raise Kafka::Error, "invalid protocol `#{uri.scheme}` in `#{connection}`"
-        end
-
-        uri
-      end
+      seed_brokers.map {|str| BrokerUri.parse(str) }
     end
   end
 end

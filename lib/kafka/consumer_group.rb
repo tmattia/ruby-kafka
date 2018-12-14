@@ -1,9 +1,11 @@
+# frozen_string_literal: true
+
 require "set"
 require "kafka/round_robin_assignment_strategy"
 
 module Kafka
   class ConsumerGroup
-    attr_reader :assigned_partitions, :generation_id
+    attr_reader :assigned_partitions, :generation_id, :group_id
 
     def initialize(cluster:, logger:, group_id:, session_timeout:, retention_time:, instrumenter:)
       @cluster = cluster
@@ -27,6 +29,10 @@ module Kafka
 
     def subscribed_partitions
       @assigned_partitions.select { |topic, _| @topics.include?(topic) }
+    end
+
+    def assigned_to?(topic, partition)
+      subscribed_partitions.fetch(topic, []).include?(partition)
     end
 
     def member?
@@ -94,13 +100,18 @@ module Kafka
     def heartbeat
       @logger.debug "Sending heartbeat..."
 
-      response = coordinator.heartbeat(
-        group_id: @group_id,
-        generation_id: @generation_id,
-        member_id: @member_id,
-      )
+      @instrumenter.instrument('heartbeat.consumer',
+                               group_id: @group_id,
+                               topic_partitions: @assigned_partitions) do
 
-      Protocol.handle_error(response.error_code)
+        response = coordinator.heartbeat(
+          group_id: @group_id,
+          generation_id: @generation_id,
+          member_id: @member_id,
+        )
+
+        Protocol.handle_error(response.error_code)
+      end
     rescue ConnectionError, UnknownMemberId, RebalanceInProgress, IllegalGeneration => e
       @logger.error "Error sending heartbeat: #{e}"
       raise HeartbeatError, e
@@ -177,7 +188,7 @@ module Kafka
 
     def coordinator
       @coordinator ||= @cluster.get_group_coordinator(group_id: @group_id)
-    rescue GroupCoordinatorNotAvailable
+    rescue CoordinatorNotAvailable
       @logger.error "Group coordinator not available for group `#{@group_id}`"
 
       sleep 1

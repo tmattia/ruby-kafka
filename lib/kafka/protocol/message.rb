@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "stringio"
 require "zlib"
 
@@ -65,7 +67,7 @@ module Kafka
         offset = decoder.int64
         message_decoder = Decoder.from_string(decoder.bytes)
 
-        crc = message_decoder.int32
+        _crc = message_decoder.int32
         magic_byte = message_decoder.int8
         attributes = message_decoder.int8
 
@@ -98,6 +100,15 @@ module Kafka
         create_time = timestamp && Time.at(timestamp / 1000.0)
 
         new(key: key, value: value, codec_id: codec_id, offset: offset, create_time: create_time)
+      end
+
+      # Ensure the backward compatibility of Message format from Kafka 0.11.x
+      def is_control_record
+        false
+      end
+
+      def headers
+        {}
       end
 
       private

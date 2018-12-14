@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "kafka/broker_pool"
 require "set"
 
@@ -38,14 +40,17 @@ module Kafka
     # @param topics [Array<String>]
     # @return [nil]
     def add_target_topics(topics)
-      new_topics = Set.new(topics) - @target_topics
+      topics = Set.new(topics)
+      unless topics.subset?(@target_topics)
+        new_topics = topics - @target_topics
 
-      unless new_topics.empty?
-        @logger.info "New topics added to target list: #{new_topics.to_a.join(', ')}"
+        unless new_topics.empty?
+          @logger.info "New topics added to target list: #{new_topics.to_a.join(', ')}"
 
-        @target_topics.merge(new_topics)
+          @target_topics.merge(new_topics)
 
-        refresh_metadata!
+          refresh_metadata!
+        end
       end
     end
 
@@ -106,45 +111,32 @@ module Kafka
       connect_to_broker(get_leader_id(topic, partition))
     end
 
+    # Finds the broker acting as the coordinator of the given group.
+    #
+    # @param group_id: [String]
+    # @return [Broker] the broker that's currently coordinator.
     def get_group_coordinator(group_id:)
       @logger.debug "Getting group coordinator for `#{group_id}`"
+      refresh_metadata_if_necessary!
+      get_coordinator(Kafka::Protocol::COORDINATOR_TYPE_GROUP, group_id)
+    end
+
+    # Finds the broker acting as the coordinator of the given transaction.
+    #
+    # @param transactional_id: [String]
+    # @return [Broker] the broker that's currently coordinator.
+    def get_transaction_coordinator(transactional_id:)
+      @logger.debug "Getting transaction coordinator for `#{transactional_id}`"
 
       refresh_metadata_if_necessary!
 
-      cluster_info.brokers.each do |broker_info|
-        begin
-          broker = connect_to_broker(broker_info.node_id)
-          response = broker.find_group_coordinator(group_id: group_id)
-
-          Protocol.handle_error(response.error_code)
-
-          coordinator_id = response.coordinator_id
-
-          @logger.debug "Coordinator for group `#{group_id}` is #{coordinator_id}. Connecting..."
-
-          # It's possible that a new broker is introduced to the cluster and
-          # becomes the coordinator before we have a chance to refresh_metadata.
-          coordinator = begin
-            connect_to_broker(coordinator_id)
-          rescue Kafka::NoSuchBroker
-            @logger.debug "Broker #{coordinator_id} missing from broker cache, refreshing"
-            refresh_metadata!
-            connect_to_broker(coordinator_id)
-          end
-
-          @logger.debug "Connected to coordinator: #{coordinator} for group `#{group_id}`"
-
-          return coordinator
-        rescue GroupCoordinatorNotAvailable
-          @logger.debug "Coordinator not available; retrying in 1s"
-          sleep 1
-          retry
-        rescue ConnectionError => e
-          @logger.error "Failed to get group coordinator info from #{broker}: #{e}"
-        end
+      if transactional_id.nil?
+        # Get a random_broker
+        @logger.debug "Transaction ID is not available. Choose a random broker."
+        return random_broker
+      else
+        get_coordinator(Kafka::Protocol::COORDINATOR_TYPE_TRANSACTION, transactional_id)
       end
-
-      raise Kafka::Error, "Failed to find group coordinator"
     end
 
     def partitions_for(topic)
@@ -184,6 +176,11 @@ module Kafka
         end
       rescue Kafka::LeaderNotAvailable
         @logger.warn "Leader not yet available for `#{name}`, waiting 1s..."
+        sleep 1
+
+        retry
+      rescue Kafka::UnknownTopicOrPartition
+        @logger.warn "Topic `#{name}` not yet created, waiting 1s..."
         sleep 1
 
         retry
@@ -228,6 +225,31 @@ module Kafka
       topic_description.configs.each_with_object({}) do |config, hash|
         hash[config.name] = config.value
       end
+    end
+
+    def alter_topic(name, configs = {})
+      options = {
+        resources: [[Kafka::Protocol::RESOURCE_TYPE_TOPIC, name, configs]]
+      }
+
+      broker = controller_broker
+
+      @logger.info "Altering the config for topic `#{name}` using controller broker #{broker}"
+
+      response = broker.alter_configs(**options)
+
+      response.resources.each do |resource|
+        Protocol.handle_error(resource.error_code, resource.error_message)
+      end
+
+      nil
+    end
+
+    def describe_group(group_id)
+      response = get_group_coordinator(group_id: group_id).describe_groups(group_ids: [group_id])
+      group = response.groups.first
+      Protocol.handle_error(group.error_code)
+      group
     end
 
     def create_partitions_for(name, num_partitions:, timeout:)
@@ -275,8 +297,7 @@ module Kafka
             topic => broker_partitions.map {|partition|
               {
                 partition: partition,
-                time: offset,
-                max_offsets: 1,
+                time: offset
               }
             }
           }
@@ -312,18 +333,27 @@ module Kafka
       end.map(&:topic_name)
     end
 
+    def list_groups
+      refresh_metadata_if_necessary!
+      cluster_info.brokers.map do |broker|
+        response = connect_to_broker(broker.node_id).list_groups
+        Protocol.handle_error(response.error_code)
+        response.groups.map(&:group_id)
+      end.flatten.uniq
+    end
+
     def disconnect
       @broker_pool.close
+    end
+
+    def cluster_info
+      @cluster_info ||= fetch_cluster_info
     end
 
     private
 
     def get_leader_id(topic, partition)
       cluster_info.find_leader_id(topic, partition)
-    end
-
-    def cluster_info
-      @cluster_info ||= fetch_cluster_info
     end
 
     # Fetches the cluster metadata.
@@ -367,6 +397,7 @@ module Kafka
     end
 
     def random_broker
+      refresh_metadata_if_necessary!
       node_id = cluster_info.brokers.sample.node_id
       connect_to_broker(node_id)
     end
@@ -379,6 +410,46 @@ module Kafka
 
     def controller_broker
       connect_to_broker(cluster_info.controller_id)
+    end
+
+    def get_coordinator(coordinator_type, coordinator_key)
+      cluster_info.brokers.each do |broker_info|
+        begin
+          broker = connect_to_broker(broker_info.node_id)
+          response = broker.find_coordinator(
+            coordinator_type: coordinator_type,
+            coordinator_key: coordinator_key
+          )
+
+          Protocol.handle_error(response.error_code, response.error_message)
+
+          coordinator_id = response.coordinator_id
+
+          @logger.debug "Coordinator for `#{coordinator_key}` is #{coordinator_id}. Connecting..."
+
+          # It's possible that a new broker is introduced to the cluster and
+          # becomes the coordinator before we have a chance to refresh_metadata.
+          coordinator = begin
+            connect_to_broker(coordinator_id)
+          rescue Kafka::NoSuchBroker
+            @logger.debug "Broker #{coordinator_id} missing from broker cache, refreshing"
+            refresh_metadata!
+            connect_to_broker(coordinator_id)
+          end
+
+          @logger.debug "Connected to coordinator: #{coordinator} for `#{coordinator_key}`"
+
+          return coordinator
+        rescue CoordinatorNotAvailable
+          @logger.debug "Coordinator not available; retrying in 1s"
+          sleep 1
+          retry
+        rescue ConnectionError => e
+          @logger.error "Failed to get coordinator info from #{broker}: #{e}"
+        end
+      end
+
+      raise Kafka::Error, "Failed to find coordinator"
     end
   end
 end

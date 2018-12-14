@@ -1,4 +1,7 @@
-require "kafka/fetched_batch"
+# frozen_string_literal: true
+
+require "kafka/fetched_offset_resolver"
+require "kafka/fetched_batch_generator"
 
 module Kafka
 
@@ -25,6 +28,10 @@ module Kafka
       @max_bytes = max_bytes
       @max_wait_time = max_wait_time
       @topics = {}
+
+      @offset_resolver = Kafka::FetchedOffsetResolver.new(
+        logger: logger
+      )
     end
 
     def fetch_from_partition(topic, partition, offset: :latest, max_bytes: 1048576)
@@ -61,8 +68,8 @@ module Kafka
         end
       end
 
-      topics_by_broker.flat_map {|broker, topics|
-        resolve_offsets(broker, topics)
+      topics_by_broker.flat_map do |broker, topics|
+        @offset_resolver.resolve!(broker, topics)
 
         options = {
           max_wait_time: @max_wait_time * 1000, # Kafka expects ms, not secs
@@ -73,13 +80,14 @@ module Kafka
 
         response = broker.fetch_messages(**options)
 
-        response.topics.flat_map {|fetched_topic|
-          fetched_topic.partitions.map {|fetched_partition|
+        response.topics.flat_map do |fetched_topic|
+          fetched_topic.partitions.map do |fetched_partition|
             begin
               Protocol.handle_error(fetched_partition.error_code)
             rescue Kafka::OffsetOutOfRange => e
               e.topic = fetched_topic.name
               e.partition = fetched_partition.partition
+              e.offset = topics.fetch(e.topic).fetch(e.partition).fetch(:fetch_offset)
 
               raise e
             rescue Kafka::Error => e
@@ -89,64 +97,19 @@ module Kafka
               raise e
             end
 
-            messages = fetched_partition.messages.map {|message|
-              FetchedMessage.new(
-                message: message,
-                topic: fetched_topic.name,
-                partition: fetched_partition.partition,
-              )
-            }
-
-            FetchedBatch.new(
-              topic: fetched_topic.name,
-              partition: fetched_partition.partition,
-              highwater_mark_offset: fetched_partition.highwater_mark_offset,
-              messages: messages,
-            )
-          }
-        }
-      }
+            Kafka::FetchedBatchGenerator.new(
+              fetched_topic.name,
+              fetched_partition,
+              topics.fetch(fetched_topic.name).fetch(fetched_partition.partition).fetch(:fetch_offset),
+              logger: @logger
+            ).generate
+          end
+        end
+      end
     rescue Kafka::ConnectionError, Kafka::LeaderNotAvailable, Kafka::NotLeaderForPartition
       @cluster.mark_as_stale!
 
       raise
-    end
-
-    private
-
-    def resolve_offsets(broker, topics)
-      pending_topics = {}
-
-      topics.each do |topic, partitions|
-        partitions.each do |partition, options|
-          offset = options.fetch(:fetch_offset)
-          next if offset >= 0
-
-          @logger.debug "Resolving offset `#{offset}` for #{topic}/#{partition}..."
-
-          pending_topics[topic] ||= []
-          pending_topics[topic] << {
-            partition: partition,
-            time: offset,
-            max_offsets: 1,
-          }
-        end
-      end
-
-      return topics if pending_topics.empty?
-
-      response = broker.list_offsets(topics: pending_topics)
-
-      pending_topics.each do |topic, partitions|
-        partitions.each do |options|
-          partition = options.fetch(:partition)
-          resolved_offset = response.offset_for(topic, partition)
-
-          @logger.debug "Offset for #{topic}/#{partition} is #{resolved_offset.inspect}"
-
-          topics[topic][partition][:fetch_offset] = resolved_offset || 0
-        end
-      end
     end
   end
 end

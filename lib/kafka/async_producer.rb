@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "thread"
 
 module Kafka
@@ -57,6 +59,7 @@ module Kafka
   #     producer.shutdown
   #
   class AsyncProducer
+    THREAD_MUTEX = Mutex.new
 
     # Initializes a new AsyncProducer.
     #
@@ -144,11 +147,15 @@ module Kafka
     private
 
     def ensure_threads_running!
-      @worker_thread = nil unless @worker_thread && @worker_thread.alive?
-      @worker_thread ||= Thread.new { @worker.run }
+      THREAD_MUTEX.synchronize do
+        @worker_thread = nil unless @worker_thread && @worker_thread.alive?
+        @worker_thread ||= Thread.new { @worker.run }
+      end
 
-      @timer_thread = nil unless @timer_thread && @timer_thread.alive?
-      @timer_thread ||= Thread.new { @timer.run }
+      THREAD_MUTEX.synchronize do
+        @timer_thread = nil unless @timer_thread && @timer_thread.alive?
+        @timer_thread ||= Thread.new { @timer.run }
+      end
     end
 
     def buffer_overflow(topic, message)
@@ -239,8 +246,10 @@ module Kafka
 
       def deliver_messages
         @producer.deliver_messages
-      rescue DeliveryFailed, ConnectionError
-        # Failed to deliver messages -- nothing to do but try again later.
+      rescue DeliveryFailed, ConnectionError => e
+        # Failed to deliver messages -- nothing to do but log and try again later.
+        @logger.error("Failed to asynchronously deliver messages: #{e.message}")
+        @instrumenter.instrument("error.async_producer", { error: e })
       end
 
       def threshold_reached?

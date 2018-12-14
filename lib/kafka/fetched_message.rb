@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 module Kafka
   class FetchedMessage
     # @return [String] the name of the topic that the message was written to.
@@ -30,6 +32,16 @@ module Kafka
     # @return [Time] the timestamp of the message.
     def create_time
       @message.create_time
+    end
+
+    # @return [Hash<String, String>] the headers of the message.
+    def headers
+      @message.headers
+    end
+
+    # @return [Boolean] whether this record is a control record
+    def is_control_record
+      @message.is_control_record
     end
   end
 end

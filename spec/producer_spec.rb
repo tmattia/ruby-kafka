@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "fake_broker"
 require "timecop"
 
@@ -8,6 +10,7 @@ describe Kafka::Producer do
   let(:broker2) { FakeBroker.new }
   let(:compressor) { double(:compressor) }
   let(:cluster) { double(:cluster) }
+  let(:transaction_manager) { double(:transaction_manager) }
   let(:producer) { initialize_producer }
 
   before do
@@ -19,6 +22,13 @@ describe Kafka::Producer do
     allow(cluster).to receive(:get_leader).with("greetings", 1) { broker2 }
 
     allow(compressor).to receive(:compress) {|message_set| message_set }
+
+    allow(transaction_manager).to receive(:idempotent?).and_return(false)
+    allow(transaction_manager).to receive(:transactional?).and_return(false)
+    allow(transaction_manager).to receive(:next_sequence_for).and_return(0)
+    allow(transaction_manager).to receive(:producer_id).and_return(-1)
+    allow(transaction_manager).to receive(:producer_epoch).and_return(0)
+    allow(transaction_manager).to receive(:transactional_id).and_return(nil)
   end
 
   describe "#produce" do
@@ -134,10 +144,22 @@ describe Kafka::Producer do
     it "handles when a partition temporarily doesn't have a leader" do
       broker1.mark_partition_with_error(topic: "greetings", partition: 0, error_code: 5)
 
-      producer.produce("hello1", topic: "greetings", partition: 0)
+      producer.produce("hello1", topic: "greetings", partition: 0, headers: { hello: 'World' })
 
       expect { producer.deliver_messages }.to raise_error(Kafka::DeliveryFailed) {|exception|
-        expect(exception.failed_messages).to eq [Kafka::PendingMessage.new("hello1", nil, "greetings", 0, nil, now)]
+        expect(exception.failed_messages).to eq [
+          Kafka::PendingMessage.new(
+            value: "hello1",
+            key: nil,
+            headers: {
+              hello: 'World'
+            },
+            topic: "greetings",
+            partition: 0,
+            partition_key: nil,
+            create_time: now
+          )
+        ]
       }
 
       # The producer was not able to write the message, but it's still buffered.
@@ -173,10 +195,22 @@ describe Kafka::Producer do
     it "handles when there's a connection error when fetching topic metadata" do
       allow(cluster).to receive(:get_leader).and_raise(Kafka::ConnectionError)
 
-      producer.produce("hello1", topic: "greetings", partition: 0)
+      producer.produce("hello1", topic: "greetings", partition: 0, headers: { hello: 'World' })
 
       expect { producer.deliver_messages }.to raise_error(Kafka::DeliveryFailed) {|exception|
-        expect(exception.failed_messages).to eq [Kafka::PendingMessage.new("hello1", nil, "greetings", 0, nil, now)]
+        expect(exception.failed_messages).to eq([
+          Kafka::PendingMessage.new(
+            value: "hello1",
+            key: nil,
+            headers: {
+              hello: 'World'
+            },
+            topic: "greetings",
+            partition: 0,
+            partition_key: nil,
+            create_time: now
+          )
+        ])
       }
 
       # The producer was not able to write the message, but it's still buffered.
@@ -193,10 +227,22 @@ describe Kafka::Producer do
     it "handles when there's a connection error when refreshing cluster metadata" do
       allow(cluster).to receive(:refresh_metadata_if_necessary!).and_raise(Kafka::ConnectionError)
 
-      producer.produce("hello1", topic: "greetings", partition: 0)
+      producer.produce("hello1", topic: "greetings", partition: 0, headers: { hello: 'World' })
 
       expect { producer.deliver_messages }.to raise_error(Kafka::DeliveryFailed) {|exception|
-        expect(exception.failed_messages).to eq [Kafka::PendingMessage.new("hello1", nil, "greetings", 0, nil, now)]
+        expect(exception.failed_messages).to eq [
+          Kafka::PendingMessage.new(
+            value: "hello1",
+            key: nil,
+            headers: {
+              hello: 'World'
+            },
+            topic: "greetings",
+            partition: 0,
+            partition_key: nil,
+            create_time: now
+          )
+        ]
       }
 
       # The producer was not able to write the message, but it's still buffered.
@@ -280,6 +326,7 @@ describe Kafka::Producer do
   def initialize_producer(**options)
     default_options = {
       cluster: cluster,
+      transaction_manager: transaction_manager,
       logger: logger,
       instrumenter: instrumenter,
       max_retries: 2,

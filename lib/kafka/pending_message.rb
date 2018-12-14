@@ -1,10 +1,13 @@
+# frozen_string_literal: true
+
 module Kafka
   class PendingMessage
-    attr_reader :value, :key, :topic, :partition, :partition_key, :create_time, :bytesize
+    attr_reader :value, :key, :headers, :topic, :partition, :partition_key, :create_time, :bytesize
 
-    def initialize(value, key, topic, partition, partition_key, create_time)
+    def initialize(value:, key:, headers: {}, topic:, partition:, partition_key:, create_time:)
       @value = value
       @key = key
+      @headers = headers
       @topic = topic
       @partition = partition
       @partition_key = partition_key
@@ -16,6 +19,7 @@ module Kafka
       @value == other.value &&
         @key == other.key &&
         @topic == other.topic &&
+        @headers == other.headers &&
         @partition == other.partition &&
         @partition_key == other.partition_key &&
         @create_time == other.create_time &&

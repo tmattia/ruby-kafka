@@ -3,6 +3,85 @@
 Changes and additions to the library will be listed here.
 
 ## Unreleased
+- Distribute partitions across consumer groups when there are few partitions per topic (#681)
+- Fix an issue where a consumer would fail to fetch any messages (#689)
+- Instrumentation for heartbeat event
+- Synchronously stop the fetcher to prevent race condition when processing commands
+- Instrument batch fetching (#694)
+
+## 0.7.4
+- Fix wrong encoding calculation that leads to message corruption (#682, #680).
+- Change the log level of the 'Committing offsets' message to debug (#640).
+- Avoid Ruby warnings about unused vars (#679).
+- Synchronously commit offsets after HeartbeatError (#676).
+- Discard messages that were fetched under a previous consumer group generation (#665).
+- Support specifying an ssl client certificates key passphrase (#667).
+
+## 0.7.3
+
+- Synchronize access to @worker_thread and @timer_thread in AsyncProducer to prevent creating multiple threads (#661).
+
+## 0.7.2
+
+- Handle case when paused partition does not belong to group on resume (#656).
+- Fix compatibility version in documentation (#651).
+- Fix message set backward compatible (#648).
+- Refresh metadata on connection error when listing topics (#644).
+
+## 0.7.1
+
+- Compatibility with dogstatsd-ruby v4.0.0.
+- Fix consuming duplication due to redundant messages returned from Kafka (#636).
+- Fresh cluster info on fetch error (#641).
+- Exactly Once Delivery and Transactional Messaging Support (#608).
+- Support extra client certificates in the SSL Context when authenticating with Kafka (#633).
+
+## 0.7.0
+
+- Drop support for Kafka 0.10 in favor of native support for Kafka 0.11.
+- Support record headers (#604).
+- Add instrumenter and logger when async message delivery fails (#603).
+- Upgrade and rename GroupCoordinator API to FindCoordinator API (#606).
+- Refresh cluster metadata after topic re-assignment (#609).
+- Disable SASL over SSL with a new config (#613).
+- Allow listing brokers in a cluster (#626).
+- Fix Fetcher's message skipping (#625).
+
+## 0.6.7
+
+- Handle case where consumer doesn't know about the topic (#597 + 0e302cbd0f31315bf81c1d1645520413ad6b58f0)
+
+## v0.6.5
+
+- Fix bug related to partition assignment.
+
+## v0.6.4
+
+- Fix bug that caused consumers to jump back and reprocess messages (#595).
+
+## v0.6.3
+
+- Allow configuring the max size of the queue connecting the fetcher thread with the consumer.
+- Add support for the Describe Groups API (#583).
+
+## v0.6.2
+
+- Add list groups API (#582).
+- Use mutable String constructor (#584).
+
+## v0.6.1
+
+- Fix bug with exponential pausing causing pauses never to stop.
+
+## v0.6.0
+
+- Fetch messages asynchronously (#526).
+- Add support for exponential backoff in pauses (#566).
+- Instrument pause durations (#574).
+
+## v0.5.5
+
+- Support PLAINTEXT and SSL URI schemes (#550).
 
 ## v0.5.4
 

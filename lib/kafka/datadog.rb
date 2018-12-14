@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 begin
   require "datadog/statsd"
 rescue LoadError
@@ -32,8 +34,13 @@ module Kafka
         @statsd ||= ::Datadog::Statsd.new(host, port, namespace: namespace, tags: tags)
       end
 
+      def statsd=(statsd)
+        clear
+        @statsd = statsd
+      end
+
       def host
-        @host ||= ::Datadog::Statsd::DEFAULT_HOST
+        @host ||= default_host
       end
 
       def host=(host)
@@ -42,7 +49,7 @@ module Kafka
       end
 
       def port
-        @port ||= ::Datadog::Statsd::DEFAULT_PORT
+        @port ||= default_port
       end
 
       def port=(port)
@@ -69,6 +76,14 @@ module Kafka
       end
 
       private
+
+      def default_host
+        ::Datadog::Statsd.const_defined?(:Connection) ? ::Datadog::Statsd::Connection::DEFAULT_HOST : ::Datadog::Statsd::DEFAULT_HOST
+      end
+
+      def default_port
+        ::Datadog::Statsd.const_defined?(:Connection) ? ::Datadog::Statsd::Connection::DEFAULT_PORT : ::Datadog::Statsd::DEFAULT_PORT
+      end
 
       def clear
         @statsd && @statsd.close
@@ -152,7 +167,6 @@ module Kafka
 
       def process_batch(event)
         offset = event.payload.fetch(:last_offset)
-        lag = event.payload.fetch(:offset_lag)
         messages = event.payload.fetch(:message_count)
 
         tags = {
@@ -170,6 +184,20 @@ module Kafka
         end
 
         gauge("consumer.offset", offset, tags: tags)
+      end
+
+      def fetch_batch(event)
+        lag = event.payload.fetch(:offset_lag)
+        batch_size = event.payload.fetch(:message_count)
+
+        tags = {
+          client: event.payload.fetch(:client_id),
+          group_id: event.payload.fetch(:group_id),
+          topic: event.payload.fetch(:topic),
+          partition: event.payload.fetch(:partition),
+        }
+
+        histogram("consumer.batch_size", batch_size, tags: tags)
         gauge("consumer.lag", lag, tags: tags)
       end
 
@@ -210,6 +238,28 @@ module Kafka
         if event.payload.key?(:exception)
           increment("consumer.leave_group.errors", tags: tags)
         end
+      end
+
+      def loop(event)
+        tags = {
+          client: event.payload.fetch(:client_id),
+          group_id: event.payload.fetch(:group_id),
+        }
+
+        histogram("consumer.loop.duration", event.duration, tags: tags)
+      end
+
+      def pause_status(event)
+        tags = {
+          client: event.payload.fetch(:client_id),
+          group_id: event.payload.fetch(:group_id),
+          topic: event.payload.fetch(:topic),
+          partition: event.payload.fetch(:partition),
+        }
+
+        duration = event.payload.fetch(:duration)
+
+        gauge("consumer.pause.duration", duration, tags: tags)
       end
 
       attach_to "consumer.kafka"
@@ -343,6 +393,21 @@ module Kafka
       end
 
       attach_to "async_producer.kafka"
+    end
+
+    class FetcherSubscriber < StatsdSubscriber
+      def loop(event)
+        queue_size = event.payload.fetch(:queue_size)
+
+        tags = {
+          client: event.payload.fetch(:client_id),
+          group_id: event.payload.fetch(:group_id),
+        }
+
+        gauge("fetcher.queue_size", queue_size, tags: tags)
+      end
+
+      attach_to "fetcher.kafka"
     end
   end
 end

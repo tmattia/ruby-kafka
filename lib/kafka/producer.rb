@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "set"
 require "kafka/partitioner"
 require "kafka/message_buffer"
@@ -7,7 +9,6 @@ require "kafka/pending_message"
 require "kafka/compressor"
 
 module Kafka
-
   # Allows sending messages to a Kafka cluster.
   #
   # Typically you won't instantiate this class yourself, but rather have {Kafka::Client}
@@ -124,9 +125,11 @@ module Kafka
   #     end
   #
   class Producer
+    class AbortTransaction < StandardError; end
 
-    def initialize(cluster:, logger:, instrumenter:, compressor:, ack_timeout:, required_acks:, max_retries:, retry_backoff:, max_buffer_size:, max_buffer_bytesize:)
+    def initialize(cluster:, transaction_manager:, logger:, instrumenter:, compressor:, ack_timeout:, required_acks:, max_retries:, retry_backoff:, max_buffer_size:, max_buffer_bytesize:)
       @cluster = cluster
+      @transaction_manager = transaction_manager
       @logger = logger
       @instrumenter = instrumenter
       @required_acks = required_acks == :all ? -1 : required_acks
@@ -170,6 +173,7 @@ module Kafka
     #
     # @param value [String] the message data.
     # @param key [String] the message key.
+    # @param headers [Hash<String, String>] the headers for the message.
     # @param topic [String] the topic that the message should be written to.
     # @param partition [Integer] the partition that the message should be written to.
     # @param partition_key [String] the key that should be used to assign a partition.
@@ -177,14 +181,15 @@ module Kafka
     #
     # @raise [BufferOverflow] if the maximum buffer size has been reached.
     # @return [nil]
-    def produce(value, key: nil, topic:, partition: nil, partition_key: nil, create_time: Time.now)
+    def produce(value, key: nil, headers: {}, topic:, partition: nil, partition_key: nil, create_time: Time.now)
       message = PendingMessage.new(
-        value && value.to_s,
-        key && key.to_s,
-        topic.to_s,
-        partition && Integer(partition),
-        partition_key && partition_key.to_s,
-        create_time,
+        value: value && value.to_s,
+        key: key && key.to_s,
+        headers: headers,
+        topic: topic.to_s,
+        partition: partition && Integer(partition),
+        partition_key: partition_key && partition_key.to_s,
+        create_time: create_time
       )
 
       if buffer_size >= @max_buffer_size
@@ -195,6 +200,12 @@ module Kafka
       if buffer_bytesize + message.bytesize >= @max_buffer_bytesize
         buffer_overflow topic,
           "Cannot produce to #{topic}, max buffer bytesize (#{@max_buffer_bytesize} bytes) reached"
+      end
+
+      # If the producer is in transactional mode, all the message production
+      # must be used when the producer is currently in transaction
+      if @transaction_manager.transactional? && !@transaction_manager.in_transaction?
+        raise 'You must trigger begin_transaction before producing messages'
       end
 
       @target_topics.add(topic)
@@ -263,7 +274,79 @@ module Kafka
     #
     # @return [nil]
     def shutdown
+      @transaction_manager.close
       @cluster.disconnect
+    end
+
+    # Initializes the producer to ready for future transactions. This method
+    # should be triggered once, before any tranactions are created.
+    #
+    # @return [nil]
+    def init_transactions
+      @transaction_manager.init_transactions
+    end
+
+    # Mark the beginning of a transaction. This method transitions the state
+    # of the transaction trantiions to IN_TRANSACTION.
+    #
+    # All producing operations can only be executed while the transation is
+    # in this state. The records are persisted by Kafka brokers, but not visible
+    # the consumers until the #commit_transaction method is trigger. After a
+    # timeout period without committed, the transaction is timeout and
+    # considered as aborted.
+    #
+    # @return [nil]
+    def begin_transaction
+      @transaction_manager.begin_transaction
+    end
+
+    # This method commits the pending transaction, marks all the produced
+    # records committed. After that, they are visible to the consumers.
+    #
+    # This method can only be called if and only if the current transaction
+    # is at IN_TRANSACTION state.
+    #
+    # @return [nil]
+    def commit_transaction
+      @transaction_manager.commit_transaction
+    end
+
+    # This method abort the pending transaction, marks all the produced
+    # records aborted. All the records will be wiped out by the brokers and the
+    # cosumers don't have a chance to consume those messages, except they enable
+    # consuming uncommitted option.
+    #
+    # This method can only be called if and only if the current transaction
+    # is at IN_TRANSACTION state.
+    #
+    # @return [nil]
+    def abort_transaction
+      @transaction_manager.abort_transaction
+    end
+
+    # Syntactic sugar to enable easier transaction usage. Do the following steps
+    #
+    # - Start the transaction (with Producer#begin_transaction)
+    # - Yield the given block
+    # - Commit the transaction (with Producer#commit_transaction)
+    #
+    # If the block raises exception, the transaction is automatically aborted
+    # *before* bubble up the exception.
+    #
+    # If the block raises Kafka::Producer::AbortTransaction indicator exception,
+    # it aborts the transaction silently, without throwing up that exception.
+    #
+    # @return [nil]
+    def transaction
+      raise 'This method requires a block' unless block_given?
+      begin_transaction
+      yield
+      commit_transaction
+    rescue Kafka::Producer::AbortTransaction
+      abort_transaction
+    rescue
+      abort_transaction
+      raise
     end
 
     private
@@ -275,6 +358,7 @@ module Kafka
 
       operation = ProduceOperation.new(
         cluster: @cluster,
+        transaction_manager: @transaction_manager,
         buffer: @buffer,
         required_acks: @required_acks,
         ack_timeout: @ack_timeout,
@@ -352,6 +436,7 @@ module Kafka
           @buffer.write(
             value: message.value,
             key: message.key,
+            headers: message.headers,
             topic: message.topic,
             partition: partition,
             create_time: message.create_time,
@@ -388,12 +473,13 @@ module Kafka
       @buffer.each do |topic, partition, messages_for_partition|
         messages_for_partition.each do |message|
           messages << PendingMessage.new(
-            message.value,
-            message.key,
-            topic,
-            partition,
-            nil,
-            message.create_time
+            value: message.value,
+            key: message.key,
+            headers: message.headers,
+            topic: topic,
+            partition: partition,
+            partition_key: nil,
+            create_time: message.create_time
           )
         end
       end

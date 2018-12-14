@@ -37,6 +37,7 @@ A Ruby client library for [Apache Kafka](http://kafka.apache.org/), a distribute
     9. [Security](#security)
         1. [Encryption and Authentication using SSL](#encryption-and-authentication-using-ssl)
         2. [Authentication using SASL](#authentication-using-sasl)
+    10. [Topic management](#topic-management)
 4. [Design](#design)
     1. [Producer Design](#producer-design)
     2. [Asynchronous Producer Design](#asynchronous-producer-design)
@@ -89,7 +90,7 @@ Or install it yourself as:
   </tr>
   <tr>
     <th>Kafka 0.11</th>
-    <td>Limited support</td>
+    <td>Full support in v0.7.x</td>
     <td>Limited support</td>
   </tr>
   <tr>
@@ -104,8 +105,8 @@ This library is targeting Kafka 0.9 with the v0.4.x series and Kafka 0.10 with t
 - **Kafka 0.8:** Full support for the Producer API in ruby-kafka v0.4.x, but no support for consumer groups. Simple message fetching works.
 - **Kafka 0.9:** Full support for the Producer and Consumer API in ruby-kafka v0.4.x.
 - **Kafka 0.10:** Full support for the Producer and Consumer API in ruby-kafka v0.5.x. Note that you _must_ run version 0.10.1 or higher of Kafka due to limitations in 0.10.0.
-- **Kafka 0.11:** Everything that works with Kafka 0.10 should still work, but so far no features specific to Kafka 0.11 have been added.
-- **Kafka 0.11:** Everything that works with Kafka 0.10 should still work, but so far no features specific to Kafka 1.0 have been added.
+- **Kafka 0.11:** Full support for Producer API, limited support for Consumer API in ruby-kafka v0.7.x. New features in 0.11.x includes new Record Batch format, idempotent and transactional production. The missing feature is dirty reading of Consumer API.
+- **Kafka 1.0:** Everything that works with Kafka 0.11 should still work, but so far no features specific to Kafka 1.0 have been added.
 
 This library requires Ruby 2.1 or higher.
 
@@ -410,6 +411,7 @@ Compression is enabled by passing the `compression_codec` parameter to `#produce
 
 * `:snappy` for [Snappy](http://google.github.io/snappy/) compression.
 * `:gzip` for [gzip](https://en.wikipedia.org/wiki/Gzip) compression.
+* `:lz4` for [LZ4](https://en.wikipedia.org/wiki/LZ4_(compression_algorithm)) compression.
 
 By default, all message sets will be compressed if you specify a compression codec. To increase the compression threshold, set `compression_threshold` to an integer value higher than one.
 
@@ -747,7 +749,7 @@ All notifications have `group_id` in the payload, referring to the Kafka consume
   * `key` is the message key.
   * `topic` is the topic that the message was consumed from.
   * `partition` is the topic partition that the message was consumed from.
-  * `offset` is the message's offset within the topic partition. 
+  * `offset` is the message's offset within the topic partition.
   * `offset_lag` is the number of messages within the topic partition that have not yet been consumed.
 
 * `start_process_message.consumer.kafka` is sent before `process_message.consumer.kafka`, and contains the same payload. It is delivered _before_ the message is processed, rather than _after_.
@@ -756,7 +758,7 @@ All notifications have `group_id` in the payload, referring to the Kafka consume
   * `message_count` is the number of messages in the batch.
   * `topic` is the topic that the message batch was consumed from.
   * `partition` is the topic partition that the message batch was consumed from.
-  * `highwater_mark_offset` is the message batch's highest offset within the topic partition. 
+  * `highwater_mark_offset` is the message batch's highest offset within the topic partition.
   * `offset_lag` is the number of messages within the topic partition that have not yet been consumed.
 
 * `start_process_batch.consumer.kafka` is sent before `process_batch.consumer.kafka`, and contains the same payload. It is delivered _before_ the batch is processed, rather than _after_.
@@ -765,12 +767,21 @@ All notifications have `group_id` in the payload, referring to the Kafka consume
   * `group_id` is the consumer group id.
 
 * `sync_group.consumer.kafka` is sent whenever a consumer is assigned topic partitions within a consumer group. It includes the following payload:
-  * `group_id` is the consumer group id.  
-  
+  * `group_id` is the consumer group id.
+
 * `leave_group.consumer.kafka` is sent whenever a consumer leaves a consumer group. It includes the following payload:
   * `group_id` is the consumer group id.
- 
-  
+
+* `seek.consumer.kafka` is sent when a consumer first seeks to an offset. It includes the following payload:
+  * `group_id` is the consumer group id.
+  * `topic` is the topic we are seeking in.
+  * `partition` is the partition we are seeking in.
+  * `offset` is the offset we have seeked to.
+
+* `heartbeat.consumer.kafka` is sent when a consumer group completes a heartbeat. It includes the following payload:
+  * `group_id` is the consumer group id.
+  * `topic_partitions` is a hash of { topic_name => array of assigned partition IDs }
+
 #### Connection Notifications
 
 * `request.connection.kafka` is sent whenever a network request is sent to a Kafka broker. It includes the following payload:
@@ -897,7 +908,7 @@ can use:
 kafka = Kafka.new(["kafka1:9092"], ssl_ca_certs_from_system: true)
 ```
 
-This configures the store to look up CA certificates from the system default certificate store on an as needed basis. The location of the store can usually be determined by: 
+This configures the store to look up CA certificates from the system default certificate store on an as needed basis. The location of the store can usually be determined by:
 `OpenSSL::X509::DEFAULT_CERT_FILE`
 
 ##### Client Authentication
@@ -910,6 +921,7 @@ kafka = Kafka.new(
   ssl_ca_cert: File.read('my_ca_cert.pem'),
   ssl_client_cert: File.read('my_client_cert.pem'),
   ssl_client_cert_key: File.read('my_client_cert_key.pem'),
+  ssl_client_cert_key_password: 'my_client_cert_key_password',
   # ...
 )
 ```
@@ -923,6 +935,8 @@ Typically, Kafka certificates come in the JKS format, which isn't supported by r
 #### Authentication using SASL
 
 Kafka has support for using SASL to authenticate clients. Currently GSSAPI, SCRAM and PLAIN mechanisms are supported by ruby-kafka.
+
+**NOTE:** With SASL for authentication, it is highly recommended to use SSL encryption. The default behavior of ruby-kafka enforces you to use SSL and you need to configure SSL encryption by passing `ssl_ca_cert` or enabling `ssl_ca_certs_from_system`. However, this strict SSL mode check can be disabled by setting  `sasl_over_ssl` to `false` while initializing the client.
 
 ##### GSSAPI
 In order to authenticate using GSSAPI, set your principal and optionally your keytab when initializing the Kafka client:
@@ -942,17 +956,15 @@ In order to authenticate using PLAIN, you must set your username and password wh
 ```ruby
 kafka = Kafka.new(
   ["kafka1:9092"],
-  ssl_ca_cert: File.read('/etc/openssl/cert.pem'), # Optional but highly recommended
+  ssl_ca_cert: File.read('/etc/openssl/cert.pem'),
   sasl_plain_username: 'username',
   sasl_plain_password: 'password'
   # ...
 )
 ```
 
-**NOTE**: It is __highly__ recommended that you use SSL for encryption when using SASL_PLAIN
-
 ##### SCRAM
-Since 0.11 kafka supports [SCRAM](https://kafka.apache.org/documentation.html#security_sasl_scram). 
+Since 0.11 kafka supports [SCRAM](https://kafka.apache.org/documentation.html#security_sasl_scram).
 
 ```ruby
 kafka = Kafka.new(
@@ -963,6 +975,77 @@ kafka = Kafka.new(
   # ...
 )
 ```
+
+### Topic management
+
+In addition to producing and consuming messages, ruby-kafka supports managing Kafka topics and their configurations. See [the Kafka documentation](https://kafka.apache.org/documentation/#topicconfigs) for a full list of topic configuration keys.
+
+#### List all topics
+
+Return an array of topic names.
+
+```ruby
+kafka = Kafka.new(["kafka:9092"])
+kafka.topics
+# => ["topic1", "topic2", "topic3"]
+```
+
+#### Create a topic
+
+```ruby
+kafka = Kafka.new(["kafka:9092"])
+kafka.create_topic("topic")
+```
+
+By default, the new topic has 1 partition, replication factor 1 and default configs from the brokers. Those configurations are customizable:
+
+```ruby
+kafka = Kafka.new(["kafka:9092"])
+kafka.create_topic("topic",
+  num_partitions: 3,
+  replication_factor: 2,
+  config: {
+    "max.message.bytes" => 100000
+  }
+)
+```
+
+#### Create more partitions for a topic
+
+After a topic is created, you can increase the number of partitions for the topic. The new number of partitions must be greater than the current one.
+
+```ruby
+kafka = Kafka.new(["kafka:9092"])
+kafka.create_partitions_for("topic", num_partitions: 10)
+```
+
+#### Fetch configuration for a topic (alpha feature)
+
+```ruby
+kafka = Kafka.new(["kafka:9092"])
+kafka.describe_topic("topic", ["max.message.bytes", "retention.ms"])
+# => {"max.message.bytes"=>"100000", "retention.ms"=>"604800000"}
+```
+
+#### Alter a topic configuration (alpha feature)
+
+Update the topic configurations.
+
+**NOTE**: This feature is for advanced usage. Only use this if you know what you're doing.
+
+```ruby
+kafka = Kafka.new(["kafka:9092"])
+kafka.alter_topic("topic", "max.message.bytes" => 100000, "retention.ms" => 604800000)
+```
+
+#### Delete a topic
+
+```ruby
+kafka = Kafka.new(["kafka:9092"])
+kafka.delete_topic("topic")
+```
+
+After a topic is marked as deleted, Kafka only hides it from clients. It would take a while before a topic is completely deleted.
 
 ## Design
 

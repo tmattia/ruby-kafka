@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "logger"
 require "kafka/connection"
 require "kafka/protocol"
@@ -102,8 +104,8 @@ module Kafka
       send_request(request)
     end
 
-    def find_group_coordinator(**options)
-      request = Protocol::GroupCoordinatorRequest.new(**options)
+    def find_coordinator(**options)
+      request = Protocol::FindCoordinatorRequest.new(**options)
 
       send_request(request)
     end
@@ -132,14 +134,50 @@ module Kafka
       send_request(request)
     end
 
+    def alter_configs(**options)
+      request = Protocol::AlterConfigsRequest.new(**options)
+
+      send_request(request)
+    end
+
     def create_partitions(**options)
       request = Protocol::CreatePartitionsRequest.new(**options)
 
       send_request(request)
     end
 
+    def list_groups
+      request = Protocol::ListGroupsRequest.new
+
+      send_request(request)
+    end
+
     def api_versions
       request = Protocol::ApiVersionsRequest.new
+
+      send_request(request)
+    end
+
+    def describe_groups(**options)
+      request = Protocol::DescribeGroupsRequest.new(**options)
+
+      send_request(request)
+    end
+
+    def init_producer_id(**options)
+      request = Protocol::InitProducerIDRequest.new(**options)
+
+      send_request(request)
+    end
+
+    def add_partitions_to_txn(**options)
+      request = Protocol::AddPartitionsToTxnRequest.new(**options)
+
+      send_request(request)
+    end
+
+    def end_txn(**options)
+      request = Protocol::EndTxnRequest.new(**options)
 
       send_request(request)
     end

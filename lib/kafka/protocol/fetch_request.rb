@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 module Kafka
   module Protocol
 
@@ -5,16 +7,20 @@ module Kafka
     #
     # ## API Specification
     #
-    #     FetchRequest => ReplicaId MaxWaitTime MinBytes [TopicName [Partition FetchOffset MaxBytes]]
+    #     FetchRequest => ReplicaId MaxWaitTime MinBytes MaxBytes IsolationLevel [TopicName [Partition FetchOffset MaxBytes]]
     #       ReplicaId => int32
     #       MaxWaitTime => int32
     #       MinBytes => int32
+    #       MaxBytes => int32
+    #       IsolationLevel => int8
     #       TopicName => string
     #       Partition => int32
     #       FetchOffset => int64
     #       MaxBytes => int32
     #
     class FetchRequest
+      ISOLATION_READ_UNCOMMITTED = 0
+      ISOLATION_READ_COMMITTED = 1
 
       # @param max_wait_time [Integer]
       # @param min_bytes [Integer]
@@ -32,7 +38,7 @@ module Kafka
       end
 
       def api_version
-        3
+        4
       end
 
       def response_class
@@ -44,6 +50,7 @@ module Kafka
         encoder.write_int32(@max_wait_time)
         encoder.write_int32(@min_bytes)
         encoder.write_int32(@max_bytes)
+        encoder.write_int8(ISOLATION_READ_COMMITTED)
 
         encoder.write_array(@topics) do |topic, partitions|
           encoder.write_string(topic)

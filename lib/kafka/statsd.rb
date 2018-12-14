@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 begin
   require "statsd"
 rescue LoadError
@@ -105,7 +107,6 @@ module Kafka
       end
 
       def process_batch(event)
-        lag = event.payload.fetch(:offset_lag)
         messages = event.payload.fetch(:message_count)
         client = event.payload.fetch(:client_id)
         group_id = event.payload.fetch(:group_id)
@@ -118,7 +119,17 @@ module Kafka
           timing("consumer.#{client}.#{group_id}.#{topic}.#{partition}.process_batch.latency", event.duration)
           count("consumer.#{client}.#{group_id}.#{topic}.#{partition}.messages", messages)
         end
+      end
 
+      def fetch_batch(event)
+        lag = event.payload.fetch(:offset_lag)
+        batch_size = event.payload.fetch(:message_count)
+        client = event.payload.fetch(:client_id)
+        group_id = event.payload.fetch(:group_id)
+        topic = event.payload.fetch(:topic)
+        partition = event.payload.fetch(:partition)
+
+        count("consumer.#{client}.#{group_id}.#{topic}.#{partition}.batch_size", batch_size)
         gauge("consumer.#{client}.#{group_id}.#{topic}.#{partition}.lag", lag)
       end
 
@@ -153,6 +164,17 @@ module Kafka
         if event.payload.key?(:exception)
           increment("consumer.#{client}.#{group_id}.leave_group.errors")
         end
+      end
+
+      def pause_status(event)
+        client = event.payload.fetch(:client_id)
+        group_id = event.payload.fetch(:group_id)
+        topic = event.payload.fetch(:topic)
+        partition = event.payload.fetch(:partition)
+
+        duration = event.payload.fetch(:duration)
+
+        gauge("consumer.#{client}.#{group_id}.#{topic}.#{partition}.pause.duration", duration)
       end
 
       attach_to "consumer.kafka"
@@ -257,6 +279,18 @@ module Kafka
       end
 
       attach_to "async_producer.kafka"
+    end
+
+    class FetcherSubscriber < StatsdSubscriber
+      def loop(event)
+        queue_size = event.payload.fetch(:queue_size)
+        client = event.payload.fetch(:client_id)
+        group_id = event.payload.fetch(:group_id)
+
+        gauge("fetcher.#{client}.#{group_id}.queue_size", queue_size)
+      end
+
+      attach_to "fetcher.kafka"
     end
   end
 end

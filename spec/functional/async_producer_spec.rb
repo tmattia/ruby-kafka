@@ -1,6 +1,8 @@
+# frozen_string_literal: true
+
 describe "Producer API", functional: true do
   let(:producer) { kafka.async_producer(max_retries: 1, retry_backoff: 0) }
-  let(:topic) { create_random_topic(num_partitions: 3) }
+  let!(:topic) { create_random_topic(num_partitions: 3) }
 
   after do
     producer.shutdown
@@ -31,7 +33,7 @@ describe "Producer API", functional: true do
     value = rand(10_000).to_s
     producer.produce(value, topic: topic, partition: 0)
 
-    sleep 0.2
+    sleep 1
 
     messages = kafka.fetch_messages(
       topic: topic,
@@ -66,5 +68,26 @@ describe "Producer API", functional: true do
     expect(messages.last(5).map(&:value)).to eq values
 
     producer.shutdown
+  end
+
+  example 'support record headers' do
+    topic = create_random_topic(num_partitions: 1)
+
+    producer = kafka.async_producer(delivery_threshold: 1)
+    producer.produce(
+      "hello", topic: topic,
+      headers: { hello: 'World', 'greeting' => 'is great', bye: 1, love: nil }
+    )
+
+    sleep 0.2
+    messages = kafka.fetch_messages(topic: topic, partition: 0, offset: 0)
+
+    expect(messages[0].value).to eq "hello"
+    expect(messages[0].headers).to eql(
+      'hello' => 'World',
+      'greeting' => 'is great',
+      'bye' => '1',
+      'love' => ''
+    )
   end
 end
